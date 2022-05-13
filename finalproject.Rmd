@@ -1,0 +1,328 @@
+---
+title: "STAT 434 Final Project: Predicting Kobe Bryant Shot Makes and Misses"
+author: "Eric Tran"
+output: html_document
+---
+## Project Setup
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(error = TRUE)
+```
+
+#### Loading relevant libraries
+
+```{r, message = FALSE}
+library(tidyverse)
+library(tidymodels)
+library(caret)
+library(discrim)
+
+set.seed(98249)
+```
+
+## The Data
+
+You cannot have a conversation about the long history of the National Basketball Association (NBA) and the various players and famous figures who have graced the hardwood courts during that time without mentioning the late Kobe Bryant. By the time he retired from the NBA in 2016 having spent 20 years as a player, he was a living legend known for shooting and making some of the toughest, most iconic baskets in history.
+
+This dataset from Kaggle, linked [here](https://www.kaggle.com/c/kobe-bryant-shot-selection/overview), contains granular data on every single shot from Kobe's career. Variables include the type of shot (dunks, layups, etc.), the latitude and longitude data of Kobe's location when he took the shot, time remaining on the clock, shot distance from the basket, and more. The goal was to use this data to provide a prediction for shot success probability for 5000 of the observations in this dataset for which numbers were made unavailable. I entered the closed Kaggle competition "Kobe Bryant Shot Selection: Which shots did Kobe sink?"
+
+The approach I chose to take was to try various classification methods in order to group Kobe's makes and misses and use those groupings to get prediction class probabilities for makes and misses for "future" (unmarked) shots in the dataset.
+
+#### Reading in data
+
+```{r, message = FALSE}
+kobe <- read_csv("data.csv")
+```
+
+#### First few observations
+
+```{r}
+head(kobe)
+```
+
+We can see here values for the 25 variables in this dataset. I decided to drop several right off the bat for various reasons. For example, "team_name" was not needed since Kobe only played for the Los Angeles Lakers during his entire career. Other variables that I felt were not necessary included game_date and season. I did drop the "opponent" variable in this analysis, but I would note that in a future analysis I might have kept this variable and coded it since Kobe might have performed better against certain opponents than others.
+
+#### Variables to drop
+
+```{r}
+drop.cols <- c("game_event_id", "game_id", "team_id", "team_name", "game_date", "matchup","season","opponent","shot_id")
+
+kobe_clean <- kobe %>%
+  dplyr::select(-one_of(drop.cols))
+```
+
+#### Viewing data types
+
+```{r}
+sapply(kobe_clean, class)
+```
+
+From here, we see that most variables are numeric while a few are character variables. I wnat to encode (one-hot encode) these character variables, so I examined each character variable in further detail to see whether or not it was worth doing so (that could mean: are there too many levels to encode? is what the variable is measuring worth keeping?).
+
+#### Viewing unique values for character-type variables
+
+```{r}
+unique(kobe_clean[c("action_type")])
+```
+
+```{r}
+unique(kobe_clean[c("combined_shot_type")])
+```
+
+```{r}
+unique(kobe_clean[c("shot_type")])
+```
+
+```{r}
+unique(kobe_clean[c("shot_zone_area")])
+```
+
+```{r}
+unique(kobe_clean[c("shot_zone_basic")])
+```
+
+```{r}
+unique(kobe_clean[c("shot_zone_range")])
+```
+
+I chose to drop "action_type" because there were way too many (57) levels to encode, which would have made my modeling task exponentially larger and longer. I also chose to drop "shot_zone_basic" because I felt that the information provided there was already covered by the variables "shot_zone_area" and "shot_zone_range".
+
+#### Variables to drop (Part 2)
+
+```{r}
+drop.cols <- c("action_type", "shot_zone_basic")
+
+kobe_clean <- kobe_clean %>%
+  dplyr::select(-one_of(drop.cols))
+```
+
+#### One-hot encoding
+
+```{r}
+dmy <- dummyVars("~.", data = kobe_clean)
+kobe_clean <- data.frame(predict(dmy, newdata=kobe_clean))
+```
+
+#### Cleaning response variable data types
+
+```{r}
+kobe_clean <- kobe_clean %>%
+  mutate(
+    shot_made_flag = as.character(shot_made_flag)
+  )
+```
+
+## Data Train-Test Split
+
+As mentioned previously, we wanted to provide predictions for the variable "shot_made_flag" for those observations which did not have those values. Therefore, I split up the data into training and testing datasets based on the absence of a value for that variable.
+
+```{r}
+train <- kobe_clean[!is.na(kobe_clean$shot_made_flag),]
+test <- kobe_clean[is.na(kobe_clean$shot_made_flag),]
+```
+
+## Modeling
+
+I chose three primary modeling techniques for classification: K-Nearest Neighbors, Quadratic Discriminant Analysis, and Support Vector Machines. 
+
+Firstly, however, I wanted to do a Principal Component Analysis for the primary purpose to reduction in data dimensionality. I would use the principal components and the rest of the output from PCA for future modeling.
+
+#### Principal Component Analysis
+
+Data setup:
+
+```{r, message = FALSE}
+kobe_matrix <- train %>%
+  select(-shot_made_flag) %>%
+  as.matrix() 
+```
+
+```{r}
+pc <- prcomp(kobe_matrix, center = TRUE, scale = TRUE)
+```
+
+In PC1, I found that the variables that are most important involve shot distance to the rim, the "y" location of the shot relative to the basketball court, the latitude value of the shot, whether or not the shot was in the zone of less than 8 feet to the basket, and whether or not the shot was a 3-point shot.
+
+In PC2, I found that the variables that are most important involve whether or not the shot was in the zone to the right of the basket, the longitude value of the shot, the "x" location of the shot relative to the court, whether or not the shot was in the zone from between 8 to 16 feet (a midrange shot), and whether or not the shot was in the zone between the left side and center of the court facing the basket.
+
+To decide on a number of principal components to include, I looked at the percent of variance explained by each PC. To recover 80% of the variance, I chose to use 11 PCs.
+
+```{r}
+cumul_vars <- cumsum(pc$sdev^2)/sum(pc$sdev^2)
+cumul_vars
+```
+
+Given I have chosen to use 11 PCs, I define a recipe here to be used in later modeling:
+
+```{r}
+kobe_rec <- 
+  recipe(shot_made_flag ~ ., data = train) %>%
+  step_pca(all_numeric(), num_comp = 11, 
+           options = c(center = TRUE)) %>%
+  step_normalize(all_numeric())
+```
+
+```{r}
+kobe_trained <- kobe_rec %>% prep(train)
+kobe_pcs <- kobe_trained %>% bake(train)
+```
+
+With 11 PCs, these are the values for each PC as well as the shot_made_flag value (0 for miss, 1 for make) for each of the shots in our training dataset:
+
+```{r}
+kobe_pcs
+```
+
+Below are plots of all shots along the axes of PC1 vs. PC2 and PC2 vs. PC3, each observation color-coded by whether or not that shot was made.
+
+```{r}
+kobe_pcs %>%
+  ggplot(aes(x = PC01, y = PC02, color=shot_made_flag)) +
+  geom_point()
+```
+
+```{r}
+kobe_pcs %>%
+  ggplot(aes(x = PC02, y = PC03, color=shot_made_flag)) +
+  geom_point()
+```
+
+#### K-nearest Neighbors
+
+The first model I chose to work with was K-nearest neighbors in order to cluster the shot observations and then use the model fit to predict on the unknown data.
+
+```{r}
+kobe_cv <- vfold_cv(train, v = 5)
+
+knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+k_grid <- grid_regular(neighbors(c(2, 40)), levels = 10)
+
+knn_wflow <- workflow() %>%
+  add_model(knn_spec) %>%
+  add_recipe(kobe_rec) 
+
+knn_wflow %>%
+  tune_grid(
+    grid = k_grid,
+    resamples = kobe_cv
+  ) %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean))
+```
+
+With 40 neighbors as the best value for that hyperparameter for the model in terms of roc_auc score, I use that as the parameter for the model below.
+
+```{r}
+knn_spec_final <- nearest_neighbor(neighbors = 40) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+knn_wflow <- workflow() %>%
+  add_model(knn_spec_final) %>%
+  add_recipe(kobe_rec) 
+
+knn_final <- knn_wflow %>% fit(train)
+```
+
+Now, I make predictions using the model fit on the test data, specifically looking at the probability each observation fits into either class 0 (miss) or class 1 (make). I only kept class 1 since that is what will be used in the final predictions CSV file to be submitted to the Kaggle competition.
+
+```{r}
+knn_pred_make <- predict(knn_final, test, type="prob")$.pred_1
+```
+
+Prediction formatting:
+
+```{r}
+pred1 <- test %>%
+  mutate(
+    shot_id = rownames(test),
+    shot_made_flag = knn_pred_make
+  )
+
+pred1keeps <- as.vector(c("shot_id","shot_made_flag"))
+
+pred1 <- pred1[,pred1keeps]
+```
+
+```{r, message=FALSE, include=FALSE}
+write.csv(pred1, "/Users/etran 1/Desktop/college/3rdyear/STAT434/project/pred1.csv", row.names = FALSE)
+```
+
+#### Quadratic Discriminant Analysis
+
+The second model I chose to work with was Quadratic Discriminant Analysis; this is opposed to Linear Discriminant Analysis, which given how the observations were plotted very tightly I thought would have been a worse option for separating the points even after PCA.
+
+```{r}
+kobe_cv <- vfold_cv(train, v = 5)
+
+qda_spec <- discrim_regularized(frac_common_cov = 0) %>% 
+             set_engine('klaR') %>% 
+             set_mode('classification')
+
+qda_wflow <- workflow() %>%
+  add_model(qda_spec) %>%
+  add_recipe(kobe_rec) 
+
+qda_wflow %>%
+  fit_resamples(kobe_cv) %>%
+  collect_metrics()
+```
+
+```{r}
+qda_final <- qda_wflow %>% fit(train)
+
+qda_preds <- predict(qda_final, train)
+```
+
+Same way of making and saving predictions as I did previously for KNN:
+
+```{r}
+qda_pred_make <- predict(qda_final, test, type="prob")$.pred_1
+```
+
+```{r}
+pred2 <- test %>%
+  mutate(
+    shot_id = rownames(test),
+    shot_made_flag = qda_pred_make
+  )
+
+pred2keeps <- as.vector(c("shot_id","shot_made_flag"))
+
+pred2 <- pred2[,pred2keeps]
+```
+
+```{r, message=FALSE, include=FALSE}
+write.csv(pred2, "/Users/etran 1/Desktop/college/3rdyear/STAT434/project/pred2.csv", row.names = FALSE)
+```
+
+With both prediction files saved, these were submitted to the Kaggle competition.
+
+I had mentioned previously that I also did a SVM model; I chose not to include it for the final documentation since the model took a very long time to run (which makes sense due to the sheer size of the datasets involved) and because the cross-validated model metrics were very similar to what I achieved with KNN and QDA anyways.
+
+## Discussion
+
+I chose to work with the models I did because of the predictive power of those models and also the relatively good interpretability of these models. I especially place emphasis on interpretability because I want to be able to explain both my findings, but more importantly the process, of the modeling procedures to a layperson.
+
+I like that KNN is a non-parametric approach which makes no assumptions about the original data. On the other hand however, the KNN model does not explain which predictors are considered the most important.
+
+For QDA, while it does make some assumptions about the data shape, the results and coefficients are interpretable.
+
+Through my modeling, here are the score results from the Kaggle competition:
+
+![](/Users/etran 1/Desktop/college/3rdyear/STAT434/project/project_kaggleresults.png)
+
+Pred1 are the results of the KNN, while Pred2 are the results of the QDA.
+
+Both results ending up scoring pretty similarly. For my best predictions, I would have placed 856 out of 1117 teams. I note that the Kaggle defined 50% Chance Benchmark placed between 894 and 895, so my predictions were better than just a pure guess.
+
+As I reflect on my results, I think that they were alright given that I did no feature engineering and that I did not try many other models. Some low-hanging fruit in terms of future work and improvement would definitely be feature engineering: using my already-existing variables to create more refined variables for the classification and prediction.
+
+Ultimately however, I am satisfied with my results given the limited time I worked on this project. This was also a fun project to work on because it was such a large dataset and because it's a problem that is relevant to my interests in basketball and sports analytics.
+
+
+
